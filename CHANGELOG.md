@@ -4,6 +4,7 @@
 
 ### Changed
  - It now depends on two versions of `embedded-hal` at the same time.
+ - Bump MSRV to 1.74 to be able to build `embedded-hal` 1.0.
 
 ### Added
 - Added `build.rs` to check if memory.x changed
