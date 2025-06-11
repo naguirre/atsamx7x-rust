@@ -2,8 +2,12 @@
 
 ## [Unreleased]
 
+### Changed
+ - It now depends on two versions of `embedded-hal` at the same time.
+
 ### Added
 - Added `build.rs` to check if memory.x changed
+ - Traits from `delay` and `pwm` implemented for `embedded-hal` 1.0 on top of legacy ones from 0.2.7.
 
 ## [v0.4.6] 2025-03-31
 
