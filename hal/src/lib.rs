@@ -36,6 +36,8 @@ The datasheet (DS60001527F) is available via [Microchip](https://ww1.microchip.c
 
 pub use embedded_hal_02 as legacy_ehal;
 pub use embedded_hal_1 as ehal;
+pub use embedded_hal_nb as ehal_nb;
+pub use embedded_io;
 pub use fugit;
 pub use nb;
 

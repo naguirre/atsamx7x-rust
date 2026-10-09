@@ -9,7 +9,8 @@ mod app {
     use atsamx7x_hal as hal;
     use hal::clocks::*;
     use hal::efc::*;
-    use hal::ehal::prelude::*;
+    use hal::ehal_nb::serial::Read as _;
+    use hal::embedded_io::Write as _;
     use hal::fugit::RateExtU32;
     use hal::generics::events::*;
     use hal::pio::*;
@@ -95,7 +96,7 @@ mod app {
 
     #[task(local= [tx], priority = 1)]
     fn tx(ctx: tx::Context, msg: &'static str) {
-        ctx.local.tx.bwrite_all(msg.as_bytes()).unwrap();
+        ctx.local.tx.write_all(msg.as_bytes()).unwrap();
     }
 
     #[idle]

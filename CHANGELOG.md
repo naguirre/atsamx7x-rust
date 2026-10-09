@@ -5,10 +5,12 @@
 ### Changed
  - It now depends on two versions of `embedded-hal` at the same time.
  - Bump MSRV to 1.74 to be able to build `embedded-hal` 1.0.
+ - Bump MSRV to 1.81 for `embedded-io` 0.7 (`core::error::Error`).
 
 ### Added
 - Added `build.rs` to check if memory.x changed
  - Traits from `delay`, `pwm` and `pio` implemented for `embedded-hal` 1.0 on top of legacy ones from 0.2.7.
+ - `uart`: `embedded-io` 0.7 (`Read`, `Write`, `ReadReady`, `WriteReady`) and `embedded-hal-nb` 1.0 `serial` traits on `Tx`, `Rx` and `Uart`, on top of the 0.2.7 ones. `embedded_io::Read` clears a receive error once it has reported it.
 
 ## [v0.4.6] 2025-03-31
 

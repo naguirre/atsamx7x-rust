@@ -9,7 +9,7 @@ mod app {
     use atsamx7x_hal as hal;
     use hal::clocks::*;
     use hal::efc::*;
-    use hal::ehal::prelude::*;
+    use hal::ehal_nb::serial::{Read as _, Write as _};
     use hal::fugit::RateExtU32;
     use hal::generics::events::*;
     use hal::pio::*;

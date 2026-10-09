@@ -59,7 +59,7 @@ let mut uart = Uart::new_uart0(
 .unwrap();
 uart.listen(Event::RxReady);
 
-use hal::ehal::serial::{Read, Write};
+use hal::ehal_nb::serial::{Read, Write};
 
 uart.write(0xff).unwrap();
 assert_eq!(uart.read().unwrap(), 0xff);
@@ -67,8 +67,9 @@ assert_eq!(uart.read().unwrap(), 0xff);
 */
 
 use crate::clocks::{Clock, HostClock, Pck, Pck4, PeripheralClock, PeripheralIdentifier};
+use crate::ehal_nb::serial;
 use crate::fugit::HertzU32 as Hertz;
-use crate::legacy_ehal::{self, blocking}; // TODO: embedded-hal 1.0 doesn't have traits for U(S)ART
+use crate::legacy_ehal::{blocking as legacy_blocking, serial as legacy_serial};
 use crate::pac::uart0::mr::{CHMODESELECT_A as ChannelModeInner, PARSELECT_A as ParityModeInner};
 use crate::pac::{uart0::RegisterBlock, UART0, UART1, UART2};
 #[cfg(all(
@@ -538,7 +539,7 @@ impl_uart!(
     },
 );
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Possible hardware errors when reading a word from the [`Uart`] peripheral.
 pub enum UartReadError {
     /// The frame's stop bit was read as zero.
@@ -549,12 +550,41 @@ pub enum UartReadError {
     Overrun,
 }
 
+impl core::fmt::Display for UartReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Framing => "framing error",
+            Self::Parity => "parity error",
+            Self::Overrun => "overrun",
+        })
+    }
+}
+
+impl core::error::Error for UartReadError {}
+
+impl embedded_io::Error for UartReadError {
+    fn kind(&self) -> embedded_io::ErrorKind {
+        match self {
+            Self::Framing | Self::Parity => embedded_io::ErrorKind::InvalidData,
+            Self::Overrun => embedded_io::ErrorKind::Other,
+        }
+    }
+}
+
+impl serial::Error for UartReadError {
+    fn kind(&self) -> serial::ErrorKind {
+        match self {
+            Self::Framing => serial::ErrorKind::FrameFormat,
+            Self::Parity => serial::ErrorKind::Parity,
+            Self::Overrun => serial::ErrorKind::Overrun,
+        }
+    }
+}
+
 macro_rules! impl_read {
     ($($T:ty,)+) => {
         $(
-            impl<M: UartMeta> legacy_ehal::serial::Read<u8> for $T {
-                type Error = UartReadError;
-
+            impl<M: UartMeta> $T {
                 /// Reads a single word from the [`Uart`] peripheral.
                 ///
                 /// # Errors
@@ -566,22 +596,17 @@ macro_rules! impl_read {
                 /// [`UartReadError`] in hardware, and in order to keep a clean
                 /// API, [`UartReadError`]s are reported in order of priority, as follows:
                 ///
-                /// 1. [`UartReadError::Framing`],
+                /// 1. [`UartReadError::Overrun`],
                 /// 2. [`UartReadError::Parity`], and
-                /// 3. [`UartReadError::Overrun`].
+                /// 3. [`UartReadError::Framing`].
                 ///
-                /// Effectively, this means that you you will get a
-                /// [`UartReadError::Framing`] until its cause is solved, and the
-                /// error will then "downgrade" to a potential
-                /// [`UartReadError::Parity`], until that too is resolved. Repeat
-                /// for [`UartReadError::Overrun`]. If no errors are detected, the
-                /// received word is returned.
-                fn read(&mut self) -> nb::Result<u8, Self::Error> {
-                    if self.reg().sr().read().rxrdy().bit_is_clear() {
+                /// The error stays reported until [`clear_errors`](Self::clear_errors)
+                /// is called. [`embedded_io::Read`] clears it itself.
+                fn read_word(&mut self) -> nb::Result<u8, UartReadError> {
+                    let sr = self.reg().sr().read();
+                    if sr.rxrdy().bit_is_clear() {
                         return Err(nb::Error::WouldBlock);
                     }
-
-                    let sr = self.reg().sr().read();
                     if sr.ovre().bit_is_set() {
                         return Err(nb::Error::Other(UartReadError::Overrun));
                     } else if sr.pare().bit_is_set() {
@@ -589,17 +614,71 @@ macro_rules! impl_read {
                     } else if sr.frame().bit_is_set() {
                         return Err(nb::Error::Other(UartReadError::Framing));
                     }
-
-                    let read = self.reg().rhr().read().rxchr().bits();
-                    Ok(read)
+                    Ok(self.reg().rhr().read().rxchr().bits())
                 }
-            }
 
-            impl<M: UartMeta> $T {
                 /// Clear the [`UartReadError`] flags in hardware.
                 #[inline(always)]
                 pub fn clear_errors(&mut self) {
                     self.reg().cr().write(|w| w.rststa().set_bit());
+                }
+            }
+
+            impl<M: UartMeta> embedded_io::ErrorType for $T {
+                type Error = UartReadError;
+            }
+
+            impl<M: UartMeta> embedded_io::ReadReady for $T {
+                fn read_ready(&mut self) -> Result<bool, Self::Error> {
+                    Ok(self.reg().sr().read().rxrdy().bit_is_set())
+                }
+            }
+
+            impl<M: UartMeta> embedded_io::Read for $T {
+                /// Blocks until a word arrives, then returns it and the words
+                /// already waiting, up to `buf.len()`.
+                ///
+                /// A receive error is returned once and cleared in hardware,
+                /// so the next call reads again. An error met after the first
+                /// word ends the read early; the next call reports it.
+                fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+                    let Some((first, rest)) = buf.split_first_mut() else {
+                        return Ok(0);
+                    };
+                    *first = match nb::block!(self.read_word()) {
+                        Ok(word) => word,
+                        Err(e) => {
+                            self.clear_errors();
+                            return Err(e);
+                        }
+                    };
+                    let mut n = 1;
+                    for slot in rest {
+                        match self.read_word() {
+                            Ok(word) => *slot = word,
+                            Err(_) => break,
+                        }
+                        n += 1;
+                    }
+                    Ok(n)
+                }
+            }
+
+            impl<M: UartMeta> serial::ErrorType for $T {
+                type Error = UartReadError;
+            }
+
+            impl<M: UartMeta> serial::Read<u8> for $T {
+                fn read(&mut self) -> nb::Result<u8, Self::Error> {
+                    self.read_word()
+                }
+            }
+
+            impl<M: UartMeta> legacy_serial::Read<u8> for $T {
+                type Error = UartReadError;
+
+                fn read(&mut self) -> nb::Result<u8, Self::Error> {
+                    self.read_word()
                 }
             }
         )+
@@ -609,26 +688,20 @@ macro_rules! impl_read {
 macro_rules! impl_write {
     ($($T:ty,)+) => {
         $(
-            impl<M: UartMeta> legacy_ehal::serial::Write<u8> for $T {
-                type Error = ();
-
-                /// Writes a single word to the [`Uart`] peripheral.
-                ///
-                /// # Errors
-                ///
-                /// Returns [`nb::Error::WouldBlock`] if the last word has yet to
-                /// be processed.
-                fn write(&mut self, byte: u8) -> nb::Result<(), Self::Error> {
+            impl<M: UartMeta> $T {
+                /// Writes a single word, or [`nb::Error::WouldBlock`] if the
+                /// last one has yet to be taken by the transmitter.
+                fn write_word(&mut self, word: u8) -> nb::Result<(), core::convert::Infallible> {
                     if self.reg().sr().read().txrdy().bit_is_clear() {
                         return Err(nb::Error::WouldBlock);
                     }
-                    self.reg()
-                        .thr()
-                        .write(|w| unsafe { w.txchr().bits(byte) });
+                    self.reg().thr().write(|w| unsafe { w.txchr().bits(word) });
                     Ok(())
                 }
 
-                fn flush(&mut self) -> nb::Result<(), Self::Error> {
+                /// [`nb::Error::WouldBlock`] until every word written has left
+                /// the shift register.
+                fn flush_words(&mut self) -> nb::Result<(), core::convert::Infallible> {
                     if self.reg().sr().read().txempty().bit_is_clear() {
                         Err(nb::Error::WouldBlock)
                     } else {
@@ -637,10 +710,71 @@ macro_rules! impl_write {
                 }
             }
 
+            impl<M: UartMeta> embedded_io::WriteReady for $T {
+                fn write_ready(&mut self) -> Result<bool, Self::Error> {
+                    Ok(self.reg().sr().read().txrdy().bit_is_set())
+                }
+            }
+
+            impl<M: UartMeta> embedded_io::Write for $T {
+                /// Blocks until the transmitter takes a word, then queues as
+                /// many more as it takes without waiting.
+                fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+                    let Some((&first, rest)) = buf.split_first() else {
+                        return Ok(0);
+                    };
+                    nb::block!(self.write_word(first)).unwrap_or_else(|e| match e {});
+                    let mut n = 1;
+                    for &word in rest {
+                        if self.write_word(word).is_err() {
+                            break;
+                        }
+                        n += 1;
+                    }
+                    Ok(n)
+                }
+
+                fn flush(&mut self) -> Result<(), Self::Error> {
+                    nb::block!(self.flush_words()).unwrap_or_else(|e| match e {});
+                    Ok(())
+                }
+            }
+
+            impl<M: UartMeta> serial::Write<u8> for $T {
+                fn write(&mut self, word: u8) -> nb::Result<(), Self::Error> {
+                    self.write_word(word).map_err(|e| e.map(|e| match e {}))
+                }
+
+                fn flush(&mut self) -> nb::Result<(), Self::Error> {
+                    self.flush_words().map_err(|e| e.map(|e| match e {}))
+                }
+            }
+
+            impl<M: UartMeta> legacy_serial::Write<u8> for $T {
+                type Error = ();
+
+                fn write(&mut self, word: u8) -> nb::Result<(), Self::Error> {
+                    self.write_word(word).map_err(|e| e.map(|e| match e {}))
+                }
+
+                fn flush(&mut self) -> nb::Result<(), Self::Error> {
+                    self.flush_words().map_err(|e| e.map(|e| match e {}))
+                }
+            }
+
             // Provide a blocking impl, derived from the non-blocking impl above.
-            impl<M: UartMeta> blocking::serial::write::Default<u8> for $T {}
+            impl<M: UartMeta> legacy_blocking::serial::write::Default<u8> for $T {}
         )+
     }
+}
+
+// `Tx` never fails; `Rx` and `Uart` report receive errors.
+impl<M: UartMeta> embedded_io::ErrorType for Tx<M> {
+    type Error = core::convert::Infallible;
+}
+
+impl<M: UartMeta> serial::ErrorType for Tx<M> {
+    type Error = core::convert::Infallible;
 }
 
 impl_read!(Rx<M>, Uart<M>,);
