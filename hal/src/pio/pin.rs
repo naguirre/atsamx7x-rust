@@ -3,9 +3,8 @@
 use core::convert::Infallible;
 use core::marker::PhantomData;
 
-use crate::legacy_ehal::digital::v2::OutputPin; // TODO: implement embedded_hal v1.0
-#[cfg(feature = "unproven")]
-use crate::legacy_ehal::digital::v2::{InputPin, StatefulOutputPin, ToggleableOutputPin};
+use crate::ehal::digital;
+use crate::legacy_ehal::digital::v2 as legacy_digital;
 
 use paste::paste;
 
@@ -401,10 +400,76 @@ impl_reset_convert_from!(
 );
 
 //================================================================================
-// Embedded HAL traits
+// Embedded HAL 1.0 traits
 //================================================================================
 
-impl<I> OutputPin for Pin<I, Output>
+impl<I, M> digital::ErrorType for Pin<I, M>
+where
+    I: PinId,
+    M: PinMode,
+{
+    type Error = Infallible;
+}
+
+impl<I> digital::OutputPin for Pin<I, Output>
+where
+    I: PinId,
+{
+    #[inline]
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        self._set_high();
+        Ok(())
+    }
+
+    #[inline]
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        self._set_low();
+        Ok(())
+    }
+}
+
+impl<I> digital::StatefulOutputPin for Pin<I, Output>
+where
+    I: PinId,
+{
+    #[inline]
+    fn is_set_high(&mut self) -> Result<bool, Self::Error> {
+        Ok(self._is_written_high())
+    }
+
+    #[inline]
+    fn is_set_low(&mut self) -> Result<bool, Self::Error> {
+        Ok(self._is_written_low())
+    }
+
+    #[inline]
+    fn toggle(&mut self) -> Result<(), Self::Error> {
+        self._toggle();
+        Ok(())
+    }
+}
+
+impl<I, M> digital::InputPin for Pin<I, M>
+where
+    I: PinId,
+    M: PinMode,
+{
+    #[inline]
+    fn is_high(&mut self) -> Result<bool, Self::Error> {
+        Ok(self._is_read_high())
+    }
+
+    #[inline]
+    fn is_low(&mut self) -> Result<bool, Self::Error> {
+        Ok(self._is_read_low())
+    }
+}
+
+//================================================================================
+// Embedded HAL 0.2 traits
+//================================================================================
+
+impl<I> legacy_digital::OutputPin for Pin<I, Output>
 where
     I: PinId,
 {
@@ -424,7 +489,7 @@ where
 }
 
 #[cfg(feature = "unproven")]
-impl<I> ToggleableOutputPin for Pin<I, Output>
+impl<I> legacy_digital::ToggleableOutputPin for Pin<I, Output>
 where
     I: PinId,
 {
@@ -438,7 +503,7 @@ where
 }
 
 #[cfg(feature = "unproven")]
-impl<I> StatefulOutputPin for Pin<I, Output>
+impl<I> legacy_digital::StatefulOutputPin for Pin<I, Output>
 where
     I: PinId,
 {
@@ -454,7 +519,7 @@ where
 }
 
 #[cfg(feature = "unproven")]
-impl<I, M> InputPin for Pin<I, M>
+impl<I, M> legacy_digital::InputPin for Pin<I, M>
 where
     I: PinId,
     M: PinMode,

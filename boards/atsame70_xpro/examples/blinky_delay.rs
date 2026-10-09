@@ -11,7 +11,7 @@ mod app {
     use hal::clocks::*;
     use hal::efc::*;
     use hal::ehal::blocking::delay::DelayMs;
-    use hal::ehal::digital::v2::ToggleableOutputPin;
+    use hal::ehal::digital::StatefulOutputPin;
     use hal::pio::*;
     use hal::rtt::*;
     use rtt_target::rtt_init_print;

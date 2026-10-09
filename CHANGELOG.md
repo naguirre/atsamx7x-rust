@@ -8,7 +8,7 @@
 
 ### Added
 - Added `build.rs` to check if memory.x changed
- - Traits from `delay` and `pwm` implemented for `embedded-hal` 1.0 on top of legacy ones from 0.2.7.
+ - Traits from `delay`, `pwm` and `pio` implemented for `embedded-hal` 1.0 on top of legacy ones from 0.2.7.
 
 ## [v0.4.6] 2025-03-31
 

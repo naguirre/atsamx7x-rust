@@ -27,7 +27,7 @@ use hal::pio::*;
 use mcan::prelude::*;
 use typenum::consts::*;
 
-use hal::ehal::digital::v2::OutputPin as _;
+use hal::ehal::digital::OutputPin as _;
 use hal::fugit::RateExtU32 as _;
 
 use dwt_systick_monotonic::{DwtSystick, ExtU32};

@@ -10,7 +10,7 @@ mod app {
     use atsamx7x_hal as hal;
     use hal::clocks::*;
     use hal::efc::*;
-    use hal::ehal::digital::v2::ToggleableOutputPin;
+    use hal::ehal::digital::StatefulOutputPin;
     use hal::fugit::RateExtU32;
     use hal::pio::*;
     use rtt_target::{rprintln, rtt_init_print};
