@@ -844,3 +844,5 @@ mod generate;
 pub use generate::*;
 mod capture;
 pub use capture::*;
+mod pwm;
+pub use pwm::*;

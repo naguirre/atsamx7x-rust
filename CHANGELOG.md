@@ -14,6 +14,7 @@
  - `uart`: `embedded-io` 0.7 (`Read`, `Write`, `ReadReady`, `WriteReady`) and `embedded-hal-nb` 1.0 `serial` traits on `Tx`, `Rx` and `Uart`, on top of the 0.2.7 ones. `embedded_io::Read` clears a receive error once it has reported it.
  - `twi`: `embedded-hal` 1.0 `I2c` on `Twi` (writes then reads in one transaction, up to three bytes before a read sent as the internal address), next to the 0.2.7 traits. `Twi::probe` addresses a client with a quick command, for bus scans. `TwiError` gains `ArbitrationLost` and `Unsupported`.
  - `spi`: `embedded-hal` 1.0 `SpiBus` and `SpiDevice` on `Client`, `embedded-hal-nb` 1.0 `FullDuplex`, next to the 0.2.7 traits. `SpiDevice` holds the NPCS line across the whole transaction (CSAAT) and releases it with `SPI_CR.LASTXFER`; `SpiBus` is for a GPIO chip select.
+ - `tc`: PWM on a channel output, TIOA or TIOB (`Channel::into_pwm`), with the `embedded-hal` 1.0 `SetDutyCycle`. The period comes from the finest MCK division that fits the 16-bit counter.
 
 ### Fixed
 - `spi`: `Spi::select` returns `SpiError::UnconfiguredClient` for a chip select never set up, as documented; it never did.
