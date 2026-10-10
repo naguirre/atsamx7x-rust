@@ -52,7 +52,7 @@ spi.setup_client(
     &mck,
 );
 
-use hal::ehal::blocking::spi::Write;
+use hal::ehal::spi::SpiDevice;
 
 let mut client = spi.select(&pcs0).unwrap(); // borrows spi
 client.write(b"Hello").unwrap();
@@ -61,15 +61,16 @@ client.write(b"Hello").unwrap();
 
 use super::Bps;
 use crate::clocks::{Clock, HostClock, PeripheralIdentifier};
+use crate::ehal::spi::{self, ErrorKind, Mode, Operation, Phase, Polarity};
+use crate::ehal_nb::spi as nb_spi;
 use crate::fugit::{ExtU32, NanosDurationU32 as NanosDuration};
-use crate::legacy_ehal::blocking; // TODO:: implement embedded_hal 1.0 traits
+use crate::legacy_ehal::{blocking as legacy_blocking, spi as legacy_spi};
+use crate::nb;
 #[cfg(feature = "__pins-144")]
 use crate::pac::SPI1;
 use crate::pac::{spi0::tdr::PCSSELECT_A as HwChipSelect, spi0::RegisterBlock, SPI0};
 use crate::{generics, pio::*};
-use crate::{legacy_ehal, nb};
 use core::marker::PhantomData;
-use legacy_ehal::spi::Mode;
 use strum::FromRepr;
 
 use paste::*;
@@ -146,6 +147,17 @@ pub enum SpiError {
     ImpossibleFreq,
     /// A requested [`Spi`] delay could not be applied.
     ImpossibleDelay,
+}
+
+impl spi::Error for SpiError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Overrun => ErrorKind::Overrun,
+            Self::UnconfiguredClient | Self::ImpossibleFreq | Self::ImpossibleDelay => {
+                ErrorKind::Other
+            }
+        }
+    }
 }
 
 /// [`Client`] configuration.
@@ -349,7 +361,6 @@ impl<M: SpiMeta> Spi<M> {
             // use 8b words
             w.bits_()._8_bit();
 
-            use legacy_ehal::spi::{Phase, Polarity};
             match conf.mode.polarity {
                 Polarity::IdleLow => w.cpol().idle_low(),
                 Polarity::IdleHigh => w.cpol().idle_high(),
@@ -392,7 +403,7 @@ impl<'spi, M: SpiMeta> Client<'spi, M> {
     }
 
     fn write_inner(&mut self, words: &[u8], use_lastxfer: bool) -> Result<(), SpiError> {
-        use legacy_ehal::spi::FullDuplex;
+        use legacy_spi::FullDuplex;
 
         let len = words.len();
         for (i, word) in words.iter().enumerate() {
@@ -411,7 +422,7 @@ impl<'spi, M: SpiMeta> Client<'spi, M> {
         words: &'w mut [u8],
         use_lastxfer: bool,
     ) -> Result<&'w [u8], SpiError> {
-        use legacy_ehal::spi::FullDuplex;
+        use legacy_spi::FullDuplex;
 
         let len = words.len();
         for (i, word) in words.iter_mut().enumerate() {
@@ -423,6 +434,130 @@ impl<'spi, M: SpiMeta> Client<'spi, M> {
         }
 
         Ok(words)
+    }
+}
+
+/// The fastest core clock of the family, for [`Operation::DelayNs`]: a
+/// busy wait counted at this rate lasts at least as long as asked at any
+/// HCLK.
+const MAX_HCLK_HZ: u64 = 300_000_000;
+
+impl<'spi, M: SpiMeta> Client<'spi, M> {
+    /// Wait until `flag` is set, reporting an overrun instead.
+    #[inline]
+    fn wait_for<F: Fn(&crate::pac::spi0::sr::R) -> bool>(&self, flag: F) -> Result<(), SpiError> {
+        loop {
+            let sr = self.reg().sr().read();
+            if sr.ovres().bit_is_set() {
+                return Err(SpiError::Overrun);
+            }
+            if flag(&sr) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Clock one word out and the client's word in. The select line is
+    /// asserted by the first word and stays so (CSAAT) until
+    /// [`Self::deselect`].
+    fn exchange(&mut self, out: u8) -> Result<u8, SpiError> {
+        self.wait_for(|sr| sr.tdre().bit_is_set())?;
+        self.reg().tdr().write(|w| {
+            unsafe { w.td().bits(out as u16) };
+            w.pcs().variant(self.cs);
+            w.lastxfer().clear_bit()
+        });
+        self.wait_for(|sr| sr.rdrf().bit_is_set())?;
+        Ok(self.reg().rdr().read().rd().bits() as u8)
+    }
+
+    /// Wait for the last word to leave the shift register.
+    fn wait_idle(&self) -> Result<(), SpiError> {
+        self.wait_for(|sr| sr.txempty().bit_is_set())
+    }
+
+    /// Release the select line once the transfers are done.
+    fn deselect(&mut self) {
+        self.reg().cr().write(|w| w.lastxfer().set_bit());
+    }
+}
+
+impl<'spi, M: SpiMeta> spi::ErrorType for Client<'spi, M> {
+    type Error = SpiError;
+}
+
+/// For a client whose select line is a GPIO, driven by the caller or by
+/// `embedded-hal-bus`. The [`Client`]'s own NPCS line, if routed to its
+/// pin, is asserted by the first word and never released here: use
+/// [`spi::SpiDevice`] for that.
+impl<'spi, M: SpiMeta> spi::SpiBus<u8> for Client<'spi, M> {
+    fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        for word in words {
+            *word = self.exchange(0x00)?;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+        for &word in words {
+            self.exchange(word)?;
+        }
+        Ok(())
+    }
+
+    fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
+        for i in 0..read.len().max(write.len()) {
+            let word = self.exchange(write.get(i).copied().unwrap_or(0x00))?;
+            if let Some(slot) = read.get_mut(i) {
+                *slot = word;
+            }
+        }
+        Ok(())
+    }
+
+    fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        for word in words {
+            *word = self.exchange(*word)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.wait_idle()
+    }
+}
+
+/// The [`Client`]'s NPCS line is held asserted across the whole
+/// transaction, delays included, and released at its end.
+impl<'spi, M: SpiMeta> spi::SpiDevice<u8> for Client<'spi, M> {
+    fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
+        use spi::SpiBus;
+
+        let result = operations.iter_mut().try_for_each(|op| match op {
+            Operation::Read(words) => SpiBus::read(self, words),
+            Operation::Write(words) => SpiBus::write(self, words),
+            Operation::Transfer(read, write) => SpiBus::transfer(self, read, write),
+            Operation::TransferInPlace(words) => SpiBus::transfer_in_place(self, words),
+            Operation::DelayNs(ns) => {
+                self.wait_idle()?;
+                let cycles = (*ns as u64 * MAX_HCLK_HZ).div_ceil(1_000_000_000);
+                cortex_m::asm::delay(cycles.min(u32::MAX as u64) as u32);
+                Ok(())
+            }
+        });
+        let idle = self.wait_idle();
+        self.deselect();
+        result.and(idle)
+    }
+}
+
+impl<'spi, M: SpiMeta> nb_spi::FullDuplex<u8> for Client<'spi, M> {
+    fn read(&mut self) -> nb::Result<u8, Self::Error> {
+        legacy_spi::FullDuplex::read(self)
+    }
+
+    fn write(&mut self, word: u8) -> nb::Result<(), Self::Error> {
+        legacy_spi::FullDuplex::send(self, word)
     }
 }
 
@@ -467,7 +602,7 @@ impl<M: SpiMeta> crate::generics::events::EventHandler for Spi<M> {
 
 impl<'spi, M: SpiMeta> Spi<M> {
     fn select_inner<CS: ChipSelect>(&'spi mut self, cs: CS) -> Result<Client<'spi, M>, SpiError> {
-        if self.cs_configured.get(cs.as_index()).is_none() {
+        if !self.cs_configured[cs.as_index()] {
             return Err(SpiError::UnconfiguredClient);
         }
 
@@ -595,7 +730,7 @@ impl_spi!(
     },
 );
 
-impl<'spi, M: SpiMeta> legacy_ehal::spi::FullDuplex<u8> for Client<'spi, M> {
+impl<'spi, M: SpiMeta> legacy_spi::FullDuplex<u8> for Client<'spi, M> {
     type Error = SpiError;
 
     fn read(&mut self) -> nb::Result<u8, Self::Error> {
@@ -636,13 +771,16 @@ impl<'spi, M: SpiMeta> legacy_ehal::spi::FullDuplex<u8> for Client<'spi, M> {
     }
 }
 
-impl<'spi, M: SpiMeta> blocking::spi::Transactional<u8> for Client<'spi, M> {
+impl<'spi, M: SpiMeta> legacy_blocking::spi::Transactional<u8> for Client<'spi, M> {
     type Error = SpiError;
 
     /// Execute the provided transactions, deasserting the select line
     /// after the last transmitted word.
-    fn exec(&mut self, operations: &mut [blocking::spi::Operation<u8>]) -> Result<(), Self::Error> {
-        use blocking::spi::Operation;
+    fn exec(
+        &mut self,
+        operations: &mut [legacy_blocking::spi::Operation<u8>],
+    ) -> Result<(), Self::Error> {
+        use legacy_blocking::spi::Operation;
 
         let len = operations.len();
         for (i, o) in operations.iter_mut().enumerate() {
@@ -660,7 +798,7 @@ impl<'spi, M: SpiMeta> blocking::spi::Transactional<u8> for Client<'spi, M> {
     }
 }
 
-impl<'spi, M: SpiMeta> blocking::spi::Write<u8> for Client<'spi, M> {
+impl<'spi, M: SpiMeta> legacy_blocking::spi::Write<u8> for Client<'spi, M> {
     type Error = SpiError;
 
     /// Write `words` to the client, discarding all words received
@@ -671,7 +809,7 @@ impl<'spi, M: SpiMeta> blocking::spi::Write<u8> for Client<'spi, M> {
     }
 }
 
-impl<'spi, M: SpiMeta> blocking::spi::Transfer<u8> for Client<'spi, M> {
+impl<'spi, M: SpiMeta> legacy_blocking::spi::Transfer<u8> for Client<'spi, M> {
     type Error = SpiError;
 
     /// Write `words` to the client, recording all words received from
