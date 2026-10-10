@@ -11,6 +11,7 @@
 - Added `build.rs` to check if memory.x changed
  - Traits from `delay`, `pwm` and `pio` implemented for `embedded-hal` 1.0 on top of legacy ones from 0.2.7.
  - `uart`: `embedded-io` 0.7 (`Read`, `Write`, `ReadReady`, `WriteReady`) and `embedded-hal-nb` 1.0 `serial` traits on `Tx`, `Rx` and `Uart`, on top of the 0.2.7 ones. `embedded_io::Read` clears a receive error once it has reported it.
+ - `twi`: `embedded-hal` 1.0 `I2c` on `Twi` (writes then reads in one transaction, up to three bytes before a read sent as the internal address), next to the 0.2.7 traits. `Twi::probe` addresses a client with a quick command, for bus scans. `TwiError` gains `ArbitrationLost` and `Unsupported`.
 
 ## [v0.4.6] 2025-03-31
 

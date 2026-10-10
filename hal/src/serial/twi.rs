@@ -35,7 +35,7 @@ let mut twi = Twi::new_twihs0(
 )
 .unwrap();
 
-use hal::ehal::blocking::i2c::WriteRead;
+use hal::ehal::i2c::I2c;
 
 let mut buffer: [u8; 18] = [0; 18];
 twi.write_read(0x0, &[0b1000_0000], &mut buffer).unwrap();
@@ -43,8 +43,9 @@ twi.write_read(0x0, &[0b1000_0000], &mut buffer).unwrap();
 */
 
 use crate::clocks::{Clock, Hertz, HostClock, PeripheralIdentifier};
+use crate::ehal::i2c::{self, ErrorKind, NoAcknowledgeSource, Operation};
 use crate::generics;
-use crate::legacy_ehal::blocking; // TODO: address I²C from embedded-hal 1.0
+use crate::legacy_ehal::blocking as legacy_blocking;
 #[cfg(feature = "reconfigurable-system-pins")]
 use crate::pac::TWIHS1;
 #[cfg(not(feature = "__pins-64"))]
@@ -79,6 +80,22 @@ pub enum TwiError {
     /// A data or address byte has not been acknowledged by the
     /// client.
     NotAcknowledged,
+    /// Another host took the bus.
+    ArbitrationLost,
+    /// An [`I2c`](i2c::I2c) transaction the peripheral cannot produce:
+    /// a write after a read, or an empty read.
+    Unsupported,
+}
+
+impl i2c::Error for TwiError {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            Self::NotAcknowledged => ErrorKind::NoAcknowledge(NoAcknowledgeSource::Unknown),
+            Self::ArbitrationLost => ErrorKind::ArbitrationLoss,
+            Self::Overrun => ErrorKind::Overrun,
+            Self::ImpossibleFreq | Self::Underrun | Self::Unsupported => ErrorKind::Other,
+        }
+    }
 }
 
 /// TWIHS abstraction.
@@ -225,8 +242,80 @@ impl<M: TwiMeta> Twi<M> {
             return Err(TwiError::Underrun);
         } else if sr.nack().bit_is_set() {
             return Err(TwiError::NotAcknowledged);
+        } else if sr.arblst().bit_is_set() {
+            return Err(TwiError::ArbitrationLost);
         }
         Ok(f(&sr))
+    }
+
+    /// Wait until `flag` is set, or the transfer ends on an error.
+    #[inline]
+    fn wait_for<F: Fn(&StatusRegister) -> bool>(&mut self, flag: F) -> Result<(), TwiError> {
+        while !self.poll_status(&flag)? {}
+        Ok(())
+    }
+
+    /// Program the client address, up to three internal address bytes
+    /// (sent by the peripheral itself, then a repeated START for a read)
+    /// and the direction.
+    fn set_address(&mut self, address: u8, internal: &[u8], read: bool) {
+        let iadr = internal
+            .iter()
+            .fold(0u32, |acc, &byte| (acc << 8) | byte as u32);
+        self.reg().iadr().write(|w| unsafe { w.iadr().bits(iadr) });
+        self.reg().mmr().write(|w| {
+            match internal.len() {
+                0 => w.iadrsz().none(),
+                1 => w.iadrsz()._1_byte(),
+                2 => w.iadrsz()._2_byte(),
+                _ => w.iadrsz()._3_byte(),
+            };
+            w.mread().bit(read);
+            unsafe { w.dadr().bits(address) }
+        });
+    }
+
+    /// Address `address` with no data: the acknowledge is the answer.
+    /// What a bus scan does (I²C quick command).
+    pub fn probe(&mut self, address: u8) -> Result<(), TwiError> {
+        self.set_address(address, &[], false);
+        self.reg().cr().write(|w| w.quick().set_bit());
+        self.wait_for(|sr| sr.txcomp().bit_is_set())
+    }
+
+    /// Send the bytes of `writes` back to back, without a STOP.
+    fn put_bytes(&mut self, writes: &[Operation<'_>]) -> Result<(), TwiError> {
+        for op in writes {
+            if let Operation::Write(bytes) = op {
+                for &byte in bytes.iter() {
+                    // The first write to THR also issues the START.
+                    self.reg().thr().write(|w| unsafe { w.txdata().bits(byte) });
+                    self.wait_for(|sr| sr.txrdy().bit_is_set())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Receive `len` bytes into the buffers of `reads`, then the STOP.
+    /// The STOP goes out with the acknowledge of the next-to-last byte, so
+    /// the last one is not acknowledged; a single byte has it set with the
+    /// START by the caller.
+    fn get_bytes(&mut self, reads: &mut [Operation<'_>], len: usize) -> Result<(), TwiError> {
+        let mut i = 0;
+        for op in reads {
+            if let Operation::Read(buffer) = op {
+                for slot in buffer.iter_mut() {
+                    self.wait_for(|sr| sr.rxrdy().bit_is_set())?;
+                    if i + 2 == len {
+                        self.reg().cr().write(|w| w.stop().set_bit());
+                    }
+                    *slot = self.reg().rhr().read().rxdata().bits();
+                    i += 1;
+                }
+            }
+        }
+        self.wait_for(|sr| sr.txcomp().bit_is_set())
     }
 }
 
@@ -310,7 +399,85 @@ impl_twi!(
     },
 );
 
-impl<M: TwiMeta> blocking::i2c::Read for Twi<M> {
+impl<M: TwiMeta> i2c::ErrorType for Twi<M> {
+    type Error = TwiError;
+}
+
+impl<M: TwiMeta> i2c::I2c for Twi<M> {
+    /// Writes first, then reads: adjacent operations of one kind are
+    /// merged, one repeated START separates the writes from the reads, one
+    /// STOP ends the transaction. A write after a read is
+    /// [`TwiError::Unsupported`].
+    ///
+    /// Up to three bytes written before a read go out as the internal
+    /// address, the peripheral sending them and the repeated START itself.
+    /// Longer writes are sent by hand, then the repeated START. A single
+    /// empty write is a quick command, see [`Twi::probe`].
+    fn transaction(
+        &mut self,
+        address: u8,
+        operations: &mut [Operation<'_>],
+    ) -> Result<(), Self::Error> {
+        let split = operations
+            .iter()
+            .position(|op| matches!(op, Operation::Read(_)))
+            .unwrap_or(operations.len());
+        let (writes, reads) = operations.split_at_mut(split);
+        if reads.iter().any(|op| matches!(op, Operation::Write(_))) {
+            return Err(TwiError::Unsupported);
+        }
+        let length = |ops: &[Operation<'_>]| -> usize {
+            ops.iter()
+                .map(|op| match op {
+                    Operation::Read(buffer) => buffer.len(),
+                    Operation::Write(bytes) => bytes.len(),
+                })
+                .sum()
+        };
+        let (write_len, read_len) = (length(writes), length(reads));
+
+        if reads.is_empty() {
+            if writes.is_empty() {
+                return Ok(());
+            }
+            if write_len == 0 {
+                return self.probe(address);
+            }
+            self.set_address(address, &[], false);
+            self.put_bytes(writes)?;
+            self.reg().cr().write(|w| w.stop().set_bit());
+            return self.wait_for(|sr| sr.txcomp().bit_is_set());
+        }
+        if read_len == 0 {
+            return Err(TwiError::Unsupported);
+        }
+
+        if write_len <= 3 {
+            let mut internal = [0u8; 3];
+            let mut n = 0;
+            for op in writes.iter() {
+                if let Operation::Write(bytes) = op {
+                    internal[n..n + bytes.len()].copy_from_slice(bytes);
+                    n += bytes.len();
+                }
+            }
+            self.set_address(address, &internal[..n], true);
+        } else {
+            self.set_address(address, &[], false);
+            self.put_bytes(writes)?;
+            self.set_address(address, &[], true);
+        }
+        // A single byte needs the STOP with the START, or the peripheral
+        // reads on.
+        self.reg().cr().write(|w| {
+            w.start().set_bit();
+            w.stop().bit(read_len == 1)
+        });
+        self.get_bytes(reads, read_len)
+    }
+}
+
+impl<M: TwiMeta> legacy_blocking::i2c::Read for Twi<M> {
     type Error = TwiError;
 
     fn read(&mut self, address: u8, buffer: &mut [u8]) -> Result<(), Self::Error> {
@@ -325,7 +492,7 @@ impl<M: TwiMeta> blocking::i2c::Read for Twi<M> {
     }
 }
 
-impl<M: TwiMeta> blocking::i2c::Write for Twi<M> {
+impl<M: TwiMeta> legacy_blocking::i2c::Write for Twi<M> {
     type Error = TwiError;
 
     fn write(&mut self, address: u8, buffer: &[u8]) -> Result<(), Self::Error> {
@@ -340,7 +507,7 @@ impl<M: TwiMeta> blocking::i2c::Write for Twi<M> {
     }
 }
 
-impl<M: TwiMeta> blocking::i2c::WriteRead for Twi<M> {
+impl<M: TwiMeta> legacy_blocking::i2c::WriteRead for Twi<M> {
     type Error = TwiError;
     fn write_read(
         &mut self,
@@ -366,19 +533,19 @@ enum TransactionalState {
     Uninitialized,
 }
 
-impl<M: TwiMeta> blocking::i2c::Transactional for Twi<M> {
+impl<M: TwiMeta> legacy_blocking::i2c::Transactional for Twi<M> {
     type Error = TwiError;
 
     fn exec(
         &mut self,
         address: u8,
-        operations: &mut [blocking::i2c::Operation],
+        operations: &mut [legacy_blocking::i2c::Operation],
     ) -> Result<(), Self::Error> {
         let mut state = TransactionalState::Uninitialized;
 
         for operation in operations {
             match operation {
-                blocking::i2c::Operation::Read(buffer) => {
+                legacy_blocking::i2c::Operation::Read(buffer) => {
                     // If not already reading setup for read.
                     if state != TransactionalState::Reading {
                         self.setup_transaction(address, TwiAction::Read);
@@ -388,7 +555,7 @@ impl<M: TwiMeta> blocking::i2c::Transactional for Twi<M> {
 
                     self.read(buffer)?;
                 }
-                blocking::i2c::Operation::Write(buffer) => {
+                legacy_blocking::i2c::Operation::Write(buffer) => {
                     // If not already writing setup for write.
                     if state != TransactionalState::Writing {
                         self.setup_transaction(address, TwiAction::Write);

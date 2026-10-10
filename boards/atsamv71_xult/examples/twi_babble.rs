@@ -10,7 +10,7 @@ mod app {
     use atsamx7x_hal as hal;
     use hal::clocks::*;
     use hal::efc::*;
-    use hal::ehal::blocking::i2c::Write;
+    use hal::ehal::i2c::I2c;
     use hal::fugit::RateExtU32;
     use hal::pio::*;
     use hal::serial::twi::*;
